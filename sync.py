@@ -674,7 +674,14 @@ def main():
             state["last_history_sync_unix"] = time.time()
         else:
             write_history_to_safari(new_visits)
-            state["last_history_sync_unix"] = time.time()
+            # Advance watermark to the latest visit we actually read, not wall clock.
+            # Firefox buffers writes in WAL; a visit can appear in places.sqlite
+            # long after it occurred. Using time.time() would skip those late arrivals.
+            if new_visits:
+                state["last_history_sync_unix"] = max(
+                    v["visit_time_unix"] for v in new_visits
+                )
+            # If no new visits, don't advance — keep the same watermark
     except Exception as e:
         errors.append(f"history: {e}")
         log.warning("History sync failed: %s", e)
