@@ -11,27 +11,31 @@ STATE_DIR="$HOME/.config/firefox-safari-sync"
 echo "=== Firefox → Safari Sync Daemon Installer ==="
 echo
 
-# 1. Check Python 3.10+
+# 1. Find Python 3.10+ (prefer Homebrew over system)
 echo "Checking Python version..."
-if ! command -v python3 &>/dev/null; then
-    echo "ERROR: python3 not found. Install Python 3.10+ via Homebrew: brew install python"
+PYTHON=""
+for candidate in /opt/homebrew/bin/python3 python3; do
+    if command -v "$candidate" &>/dev/null; then
+        PY_VERSION=$("$candidate" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+        PY_MAJOR=$(echo "$PY_VERSION" | cut -d. -f1)
+        PY_MINOR=$(echo "$PY_VERSION" | cut -d. -f2)
+        if [ "$PY_MAJOR" -ge 3 ] && [ "$PY_MINOR" -ge 10 ]; then
+            PYTHON="$candidate"
+            break
+        fi
+    fi
+done
+
+if [ -z "$PYTHON" ]; then
+    echo "ERROR: Python 3.10+ not found. Install via Homebrew: brew install python"
     exit 1
 fi
-
-PY_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-PY_MAJOR=$(echo "$PY_VERSION" | cut -d. -f1)
-PY_MINOR=$(echo "$PY_VERSION" | cut -d. -f2)
-
-if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 10 ]; }; then
-    echo "ERROR: Python 3.10+ required, found $PY_VERSION"
-    exit 1
-fi
-echo "  Found Python $PY_VERSION ✓"
+echo "  Found Python $PY_VERSION at $PYTHON ✓"
 
 # 2. Create venv and install deps
 echo "Setting up virtual environment..."
 if [ ! -d "$SCRIPT_DIR/venv" ]; then
-    python3 -m venv "$SCRIPT_DIR/venv"
+    "$PYTHON" -m venv "$SCRIPT_DIR/venv"
 fi
 "$SCRIPT_DIR/venv/bin/pip" install -q -r "$SCRIPT_DIR/requirements.txt"
 echo "  venv ready, lz4 installed ✓"
