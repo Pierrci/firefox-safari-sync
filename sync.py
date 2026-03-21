@@ -264,10 +264,17 @@ def read_firefox_bookmarks(profile: Path) -> list[dict]:
         if child["title"] in ("Tags",):
             continue
         cleaned = _clean_tree(child)
-        if cleaned is not None:
+        if cleaned is not None and not _is_empty_folder(cleaned):
             result.append(cleaned)
 
     return result
+
+
+def _is_empty_folder(node: dict) -> bool:
+    """Check if a folder node has no bookmarks (recursively)."""
+    if node["type"] != "folder":
+        return False
+    return all(_is_empty_folder(c) for c in node.get("children", []))
 
 
 def _clean_tree(node: dict) -> dict:
