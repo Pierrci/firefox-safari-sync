@@ -325,6 +325,7 @@ def read_new_history(profile: Path, last_sync_unix: float | None) -> list[dict]:
             FROM moz_historyvisits v
             JOIN moz_places p ON v.place_id = p.id
             WHERE v.visit_date > ?
+              AND v.visit_type NOT IN (4, 5, 6)
             ORDER BY v.visit_date ASC
             """,
             (watermark_us,),
