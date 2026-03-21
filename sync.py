@@ -484,12 +484,12 @@ def write_plist_to_safari(tabs: list[dict], bookmarks: list[dict]) -> None:
     with open(SAFARI_BOOKMARKS, "rb") as f:
         plist_data = plistlib.load(f)
 
-    bar_children = _find_bookmarks_bar(plist_data)
+    root_children = plist_data.setdefault("Children", [])
     changed = False
 
     # --- Tabs diff ---
     tabs_folder_uid = stable_uuid("firefox-tabs-folder")
-    tabs_folder = _find_or_create_folder(bar_children, TABS_FOLDER_TITLE, tabs_folder_uid)
+    tabs_folder = _find_or_create_folder(root_children, TABS_FOLDER_TITLE, tabs_folder_uid)
 
     desired_tabs = {}
     for tab in tabs:
@@ -520,7 +520,7 @@ def write_plist_to_safari(tabs: list[dict], bookmarks: list[dict]) -> None:
 
     # --- Bookmarks diff (recursive in-place merge to preserve iCloud metadata) ---
     bm_folder_uid = stable_uuid("firefox-bookmarks-folder")
-    bm_folder = _find_or_create_folder(bar_children, BOOKMARKS_FOLDER_TITLE, bm_folder_uid)
+    bm_folder = _find_or_create_folder(root_children, BOOKMARKS_FOLDER_TITLE, bm_folder_uid)
 
     bm_children = bm_folder.get("Children", [])
     if _merge_bookmark_tree(bookmarks, bm_children):
