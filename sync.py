@@ -47,6 +47,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
 )
 log = logging.getLogger(__name__)
 
@@ -103,14 +104,23 @@ def detect_firefox_profile(state: dict) -> Path:
     base = PROFILES_INI.parent
 
     # Strategy 1: [Install...] sections (Firefox 67+)
+    # Collect all install defaults, prefer non-dev-edition profiles
+    install_profiles = []
     for section in cfg.sections():
         if section.startswith("Install"):
             default = cfg.get(section, "Default", fallback=None)
             if default:
                 profile_path = base / default
                 if profile_path.is_dir():
-                    state["firefox_profile_path"] = str(profile_path)
-                    return profile_path
+                    is_dev = "dev-edition" in default.lower()
+                    install_profiles.append((is_dev, profile_path))
+
+    # Sort: non-dev first
+    install_profiles.sort(key=lambda x: x[0])
+    if install_profiles:
+        profile_path = install_profiles[0][1]
+        state["firefox_profile_path"] = str(profile_path)
+        return profile_path
 
     # Strategy 2: [Profile#] with Default=1
     for section in cfg.sections():
