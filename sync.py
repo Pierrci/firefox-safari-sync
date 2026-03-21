@@ -19,6 +19,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 
 import lz4.block
 
@@ -66,10 +67,14 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    """Persist state to disk."""
+    """Persist state to disk atomically."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    with tempfile.NamedTemporaryFile(
+        dir=STATE_DIR, mode="w", delete=False, suffix=".json"
+    ) as tmp:
+        json.dump(state, tmp, indent=2)
+        tmp_path = tmp.name
+    os.replace(tmp_path, STATE_FILE)
 
 # ---------------------------------------------------------------------------
 # Firefox profile detection
@@ -248,7 +253,9 @@ def read_firefox_bookmarks(profile: Path) -> list[dict]:
         # Skip tags and mobile
         if child["title"] in ("Tags",):
             continue
-        result.append(_clean_tree(child))
+        cleaned = _clean_tree(child)
+        if cleaned is not None:
+            result.append(cleaned)
 
     return result
 
@@ -260,7 +267,7 @@ def _clean_tree(node: dict) -> dict:
             "type": "folder",
             "title": node["title"],
             "guid": node["guid"],
-            "children": [_clean_tree(c) for c in node["children"]],
+            "children": [ct for c in node["children"] if (ct := _clean_tree(c)) is not None],
         }
     else:  # bookmark (type=1) or separator
         if node["type"] == 1 and node["url"] and not node["url"].startswith("place:"):
@@ -282,6 +289,10 @@ def read_new_history(profile: Path, last_sync_unix: float | None) -> list[dict]:
     if not places.exists():
         raise FileNotFoundError(f"places.sqlite not found at {places}")
 
+    if last_sync_unix is None:
+        # First run: no historical seeding
+        return []
+
     uri = f"file:{places}?immutable=1&mode=ro"
     try:
         conn = sqlite3.connect(uri, uri=True)
@@ -290,10 +301,6 @@ def read_new_history(profile: Path, last_sync_unix: float | None) -> list[dict]:
         raise RuntimeError(f"Cannot open places.sqlite: {e}") from e
 
     try:
-        if last_sync_unix is None:
-            # First run: no historical seeding
-            return []
-
         watermark_us = int(last_sync_unix * 1_000_000)
         rows = conn.execute(
             """
@@ -348,22 +355,80 @@ def _make_folder_node(title: str, uid: str, children: list[dict]) -> dict:
     }
 
 
-def _build_safari_tree(bm_node: dict) -> dict | None:
-    """Recursively convert a Firefox bookmark tree node to a Safari plist node."""
-    if bm_node is None:
-        return None
-    if bm_node["type"] == "folder":
-        children = []
-        for child in bm_node.get("children", []):
-            safari_child = _build_safari_tree(child)
-            if safari_child:
-                children.append(safari_child)
-        uid = stable_uuid(bm_node["guid"])
-        return _make_folder_node(bm_node["title"], uid, children)
-    elif bm_node["type"] == "bookmark":
-        uid = stable_uuid(bm_node["guid"])
-        return _make_bookmark_node(bm_node["title"], bm_node["url"], uid)
-    return None
+def _merge_bookmark_tree(firefox_nodes: list[dict], safari_children: list[dict]) -> bool:
+    """Recursively merge Firefox bookmark tree into existing Safari children list in-place.
+
+    Updates existing Safari nodes (preserving iCloud metadata keys like Sync,
+    WebBookmarkIdentifier, etc.) rather than replacing them with fresh dicts.
+    Returns True if any changes were made.
+    """
+    changed = False
+
+    # Index existing Safari children by UUID
+    existing_by_uuid = {}
+    for child in safari_children:
+        uid = child.get("WebBookmarkUUID")
+        if uid:
+            existing_by_uuid[uid] = child
+
+    # Build desired order from Firefox
+    desired_uuids = set()
+    new_children = []
+
+    for fx_node in firefox_nodes:
+        if fx_node is None:
+            continue
+
+        uid = stable_uuid(fx_node["guid"])
+        desired_uuids.add(uid)
+        existing = existing_by_uuid.get(uid)
+
+        if fx_node["type"] == "folder":
+            if existing and existing.get("WebBookmarkType") == "WebBookmarkTypeList":
+                # Update in place — preserve all metadata keys
+                if existing.get("Title") != fx_node["title"]:
+                    existing["Title"] = fx_node["title"]
+                    changed = True
+                # Recurse into children
+                sub_children = existing.get("Children", [])
+                sub_changed = _merge_bookmark_tree(
+                    fx_node.get("children", []), sub_children
+                )
+                existing["Children"] = sub_children
+                if sub_changed:
+                    changed = True
+                new_children.append(existing)
+            else:
+                # New folder
+                children = []
+                _merge_bookmark_tree(fx_node.get("children", []), children)
+                new_children.append(_make_folder_node(fx_node["title"], uid, children))
+                changed = True
+
+        elif fx_node["type"] == "bookmark":
+            if existing and existing.get("WebBookmarkType") == "WebBookmarkTypeLeaf":
+                # Update in place — preserve metadata
+                old_title = existing.get("URIDictionary", {}).get("title")
+                old_url = existing.get("URLString")
+                if old_title != fx_node["title"] or old_url != fx_node["url"]:
+                    existing["URIDictionary"] = {"title": fx_node["title"]}
+                    existing["URLString"] = fx_node["url"]
+                    changed = True
+                new_children.append(existing)
+            else:
+                # New bookmark
+                new_children.append(_make_bookmark_node(fx_node["title"], fx_node["url"], uid))
+                changed = True
+
+    # Check for removals (nodes in Safari but not in Firefox)
+    existing_uuids = set(existing_by_uuid.keys())
+    if existing_uuids - desired_uuids:
+        changed = True
+
+    # Replace the list contents in-place
+    safari_children[:] = new_children
+
+    return changed
 
 
 def _find_or_create_folder(children: list[dict], title: str, uid: str) -> dict:
@@ -400,90 +465,70 @@ def _write_plist_atomic(plist_data: dict) -> None:
     os.replace(tmp_path, SAFARI_BOOKMARKS)
 
 
-def write_tabs_to_safari(tabs: list[dict]) -> None:
-    """Write Firefox open tabs as a Safari bookmarks folder (diff-based)."""
+def write_plist_to_safari(tabs: list[dict], bookmarks: list[dict]) -> None:
+    """Write Firefox tabs and bookmarks to Safari Bookmarks.plist in a single atomic write.
+
+    Reads the plist once, applies both tabs and bookmarks diffs, and writes once
+    to minimize iCloud sync events.
+    """
     with open(SAFARI_BOOKMARKS, "rb") as f:
         plist_data = plistlib.load(f)
 
     bar_children = _find_bookmarks_bar(plist_data)
-    folder_uid = stable_uuid("firefox-tabs-folder")
-    folder = _find_or_create_folder(bar_children, TABS_FOLDER_TITLE, folder_uid)
-
-    # Build desired state
-    desired = {}
-    for tab in tabs:
-        uid = stable_uuid(tab["url"])
-        desired[uid] = _make_bookmark_node(tab["title"], tab["url"], uid)
-
-    # Current state
-    existing = {c["WebBookmarkUUID"]: c for c in folder.get("Children", [])
-                if "WebBookmarkUUID" in c}
-
-    # Diff
     changed = False
 
-    # Add or update
-    new_children = []
-    for uid, node in desired.items():
-        old = existing.get(uid)
+    # --- Tabs diff ---
+    tabs_folder_uid = stable_uuid("firefox-tabs-folder")
+    tabs_folder = _find_or_create_folder(bar_children, TABS_FOLDER_TITLE, tabs_folder_uid)
+
+    desired_tabs = {}
+    for tab in tabs:
+        uid = stable_uuid(tab["url"])
+        desired_tabs[uid] = _make_bookmark_node(tab["title"], tab["url"], uid)
+
+    existing_tabs = {c["WebBookmarkUUID"]: c for c in tabs_folder.get("Children", [])
+                     if "WebBookmarkUUID" in c}
+
+    tabs_children = []
+    for uid, node in desired_tabs.items():
+        old = existing_tabs.get(uid)
         if old:
-            # Check if content changed
             if (old.get("URIDictionary", {}).get("title") != node["URIDictionary"]["title"]
                     or old.get("URLString") != node["URLString"]):
-                new_children.append(node)
+                tabs_children.append(node)
                 changed = True
             else:
-                new_children.append(old)
+                tabs_children.append(old)
         else:
-            new_children.append(node)
+            tabs_children.append(node)
             changed = True
 
-    # Check removals
-    if set(existing.keys()) != set(desired.keys()):
+    if set(existing_tabs.keys()) != set(desired_tabs.keys()):
         changed = True
 
+    tabs_folder["Children"] = tabs_children
+
+    # --- Bookmarks diff (recursive in-place merge to preserve iCloud metadata) ---
+    bm_folder_uid = stable_uuid("firefox-bookmarks-folder")
+    bm_folder = _find_or_create_folder(bar_children, BOOKMARKS_FOLDER_TITLE, bm_folder_uid)
+
+    bm_children = bm_folder.get("Children", [])
+    if _merge_bookmark_tree(bookmarks, bm_children):
+        changed = True
+    bm_folder["Children"] = bm_children
+
+    # --- Write once ---
     if not changed:
-        log.info("Tabs: no changes detected.")
+        log.info("Tabs & bookmarks: no changes detected.")
         return
 
-    folder["Children"] = new_children
     _write_plist_atomic(plist_data)
-    log.info("Tabs: synced %d tabs to Safari.", len(tabs))
-
-
-def write_bookmarks_to_safari(bookmarks: list[dict]) -> None:
-    """Write Firefox bookmarks as a Safari bookmarks folder tree (diff-based)."""
-    with open(SAFARI_BOOKMARKS, "rb") as f:
-        plist_data = plistlib.load(f)
-
-    bar_children = _find_bookmarks_bar(plist_data)
-    folder_uid = stable_uuid("firefox-bookmarks-folder")
-    folder = _find_or_create_folder(bar_children, BOOKMARKS_FOLDER_TITLE, folder_uid)
-
-    # Build new children from Firefox bookmark tree
-    new_children = []
-    for root_folder in bookmarks:
-        safari_node = _build_safari_tree(root_folder)
-        if safari_node:
-            new_children.append(safari_node)
-
-    # Simple deep comparison: serialize to check for changes
-    old_json = json.dumps(folder.get("Children", []), sort_keys=True, default=str)
-    new_json = json.dumps(new_children, sort_keys=True, default=str)
-
-    if old_json == new_json:
-        log.info("Bookmarks: no changes detected.")
-        return
-
-    folder["Children"] = new_children
-    _write_plist_atomic(plist_data)
-    log.info("Bookmarks: synced to Safari.")
+    log.info("Plist synced: %d tabs, %d bookmark folders.", len(tabs), len(bookmarks))
 
 
 def _extract_domain(url: str) -> str | None:
     """Extract domain expansion from URL (e.g., 'example.com' from 'https://www.example.com/path')."""
     try:
-        from urllib.parse import urlparse
         parsed = urlparse(url)
         host = parsed.hostname or ""
         # Remove www. prefix for domain_expansion
@@ -557,10 +602,14 @@ def write_history_to_safari(visits: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 def check_full_disk_access() -> bool:
-    """Verify we can read Safari files (requires Full Disk Access)."""
+    """Verify we can read/write Safari files (requires Full Disk Access)."""
     try:
         with open(SAFARI_BOOKMARKS, "rb") as f:
             f.read(1)
+        # Also verify History.db is writable
+        if SAFARI_HISTORY.exists():
+            with open(SAFARI_HISTORY, "r+b") as f:
+                f.read(1)
         return True
     except PermissionError:
         log.error(
@@ -589,24 +638,14 @@ def main():
 
     errors = []
 
-    # Tabs → "Firefox Tabs" bookmark folder
+    # Tabs + Bookmarks → single Bookmarks.plist write
     try:
         tabs = read_open_tabs(profile)
-        if tabs:
-            write_tabs_to_safari(tabs)
-        else:
-            log.info("No tabs to sync.")
-    except Exception as e:
-        errors.append(f"tabs: {e}")
-        log.warning("Tabs sync failed: %s", e)
-
-    # Bookmarks → "Firefox" bookmark folder tree
-    try:
         bookmarks = read_firefox_bookmarks(profile)
-        write_bookmarks_to_safari(bookmarks)
+        write_plist_to_safari(tabs, bookmarks)
     except Exception as e:
-        errors.append(f"bookmarks: {e}")
-        log.warning("Bookmarks sync failed: %s", e)
+        errors.append(f"plist: {e}")
+        log.warning("Tabs/bookmarks sync failed: %s", e)
 
     # History → Safari History.db (incremental)
     try:
