@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Firefox → Safari one-way sync daemon.
 
-Reads open tabs, bookmarks, and history from a local Firefox profile and
-writes them into Safari's on-disk files (Bookmarks.plist, History.db).
-iCloud then propagates the Safari-side changes to iOS.
+Reads open tabs and bookmarks from a local Firefox profile and writes them
+into Safari's Bookmarks.plist. iCloud then propagates the changes to iOS.
 
 Designed to run as a macOS LaunchAgent on a 5-minute interval.
 """
@@ -16,10 +15,8 @@ import plistlib
 import sqlite3
 import sys
 import tempfile
-import time
 import uuid
 from pathlib import Path
-from urllib.parse import urlparse
 
 import lz4.block
 
@@ -29,13 +26,11 @@ import lz4.block
 
 MOZLZ4_MAGIC = b"mozLz40\0"
 UUID_NAMESPACE = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")  # NAMESPACE_URL
-COCOA_OFFSET = 978307200  # seconds between Unix epoch (1970) and Cocoa epoch (2001)
 
 STATE_DIR = Path.home() / ".config" / "firefox-safari-sync"
 STATE_FILE = STATE_DIR / "state.json"
 
 SAFARI_BOOKMARKS = Path.home() / "Library" / "Safari" / "Bookmarks.plist"
-SAFARI_HISTORY = Path.home() / "Library" / "Safari" / "History.db"
 
 FIREFOX_BASE = Path.home() / "Library" / "Application Support" / "Firefox"
 PROFILES_INI = FIREFOX_BASE / "profiles.ini"
@@ -61,7 +56,6 @@ def load_state() -> dict:
         with open(STATE_FILE) as f:
             return json.load(f)
     return {
-        "last_history_sync_unix": None,
         "firefox_profile_path": None,
         "schema_version": 1,
     }
@@ -297,53 +291,6 @@ def _clean_tree(node: dict) -> dict:
         return None  # separators and place: URIs are skipped
 
 
-def read_new_history(profile: Path, last_sync_unix: float | None) -> list[dict]:
-    """Read Firefox history entries newer than the watermark.
-
-    Returns a list of dicts with 'url', 'title', 'visit_time_unix' keys.
-    """
-    places = profile / "places.sqlite"
-    if not places.exists():
-        raise FileNotFoundError(f"places.sqlite not found at {places}")
-
-    if last_sync_unix is None:
-        # First run: no historical seeding
-        return []
-
-    uri = f"file:{places}?immutable=1&mode=ro"
-    try:
-        conn = sqlite3.connect(uri, uri=True)
-        conn.row_factory = sqlite3.Row
-    except sqlite3.DatabaseError as e:
-        raise RuntimeError(f"Cannot open places.sqlite: {e}") from e
-
-    try:
-        watermark_us = int(last_sync_unix * 1_000_000)
-        rows = conn.execute(
-            """
-            SELECT p.url, p.title, v.visit_date
-            FROM moz_historyvisits v
-            JOIN moz_places p ON v.place_id = p.id
-            WHERE v.visit_date > ?
-              AND v.visit_type NOT IN (4, 5, 6)
-            ORDER BY v.visit_date ASC
-            """,
-            (watermark_us,),
-        ).fetchall()
-    finally:
-        conn.close()
-
-    visits = []
-    for row in rows:
-        url = row["url"]
-        if url and not url.startswith("about:"):
-            visits.append({
-                "url": url,
-                "title": row["title"] or url,
-                "visit_time_unix": row["visit_date"] / 1_000_000,
-            })
-    return visits
-
 # ---------------------------------------------------------------------------
 # Safari writers
 # ---------------------------------------------------------------------------
@@ -544,90 +491,15 @@ def write_plist_to_safari(tabs: list[dict], bookmarks: list[dict]) -> None:
     log.info("Plist synced: %d tabs, %d bookmark folders.", len(tabs), len(bookmarks))
 
 
-def _extract_domain(url: str) -> str | None:
-    """Extract domain expansion from URL (e.g., 'example.com' from 'https://www.example.com/path')."""
-    try:
-        parsed = urlparse(url)
-        host = parsed.hostname or ""
-        # Remove www. prefix for domain_expansion
-        if host.startswith("www."):
-            host = host[4:]
-        return host or None
-    except Exception:
-        return None
-
-
-def write_history_to_safari(visits: list[dict]) -> None:
-    """Write new history entries to Safari History.db."""
-    if not visits:
-        log.info("History: no new visits to sync.")
-        return
-
-    try:
-        conn = sqlite3.connect(str(SAFARI_HISTORY), timeout=5)
-    except sqlite3.OperationalError as e:
-        raise RuntimeError(f"Cannot open History.db (Safari may hold lock): {e}") from e
-
-    try:
-        with conn:
-            for visit in visits:
-                url = visit["url"]
-                title = visit["title"]
-                visit_time_cocoa = visit["visit_time_unix"] - COCOA_OFFSET
-                domain = _extract_domain(url)
-
-                # Application-level upsert for history_items
-                row = conn.execute(
-                    "SELECT id FROM history_items WHERE url = ?", (url,)
-                ).fetchone()
-
-                if row:
-                    item_id = row[0]
-                    conn.execute(
-                        """UPDATE history_items
-                           SET visit_count = visit_count + 1,
-                               should_recompute_derived_visit_counts = 1
-                           WHERE id = ?""",
-                        (item_id,),
-                    )
-                else:
-                    cursor = conn.execute(
-                        """INSERT INTO history_items
-                           (url, domain_expansion, visit_count,
-                            daily_visit_counts, weekly_visit_counts,
-                            autocomplete_triggers,
-                            should_recompute_derived_visit_counts,
-                            visit_count_score)
-                           VALUES (?, ?, 1, x'', NULL, NULL, 1, 0)""",
-                        (url, domain),
-                    )
-                    item_id = cursor.lastrowid
-
-                # Insert the visit
-                conn.execute(
-                    """INSERT INTO history_visits
-                       (history_item, visit_time, title)
-                       VALUES (?, ?, ?)""",
-                    (item_id, visit_time_cocoa, title),
-                )
-    finally:
-        conn.close()
-
-    log.info("History: synced %d visits to Safari.", len(visits))
-
 # ---------------------------------------------------------------------------
 # FDA check
 # ---------------------------------------------------------------------------
 
 def check_full_disk_access() -> bool:
-    """Verify we can read/write Safari files (requires Full Disk Access)."""
+    """Verify we can read Safari files (requires Full Disk Access)."""
     try:
         with open(SAFARI_BOOKMARKS, "rb") as f:
             f.read(1)
-        # Also verify History.db is writable
-        if SAFARI_HISTORY.exists():
-            with open(SAFARI_HISTORY, "r+b") as f:
-                f.read(1)
         return True
     except PermissionError:
         log.error(
@@ -664,28 +536,6 @@ def main():
     except Exception as e:
         errors.append(f"plist: {e}")
         log.warning("Tabs/bookmarks sync failed: %s", e)
-
-    # History → Safari History.db (incremental)
-    try:
-        new_visits = read_new_history(profile, state.get("last_history_sync_unix"))
-        if state.get("last_history_sync_unix") is None:
-            # First run: set watermark, no historical seeding
-            log.info("History: first run — setting watermark, no historical sync.")
-            state["last_history_sync_unix"] = time.time()
-        else:
-            write_history_to_safari(new_visits)
-            # Advance watermark to the latest visit we actually read, not wall clock.
-            # Firefox buffers writes in WAL; a visit can appear in places.sqlite
-            # long after it occurred. Using time.time() would skip those late arrivals.
-            if new_visits:
-                state["last_history_sync_unix"] = max(
-                    v["visit_time_unix"] for v in new_visits
-                )
-            # If no new visits, don't advance — keep the same watermark
-    except Exception as e:
-        errors.append(f"history: {e}")
-        log.warning("History sync failed: %s", e)
-        # Do NOT update watermark on failure
 
     save_state(state)
 

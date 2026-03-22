@@ -1,6 +1,6 @@
 # firefox-safari-sync
 
-One-way sync from Firefox on macOS to Safari — bookmarks, open tabs, and history.
+One-way sync from Firefox on macOS to Safari — bookmarks and open tabs.
 
 Runs as a macOS LaunchAgent every 5 minutes. iCloud propagates Safari changes to iOS automatically.
 
@@ -65,21 +65,16 @@ A successful cycle ends with:
 |---|---|---|
 | Firefox open tabs | "Firefox Tabs" bookmarks folder | Every cycle |
 | Firefox bookmarks | "Firefox" bookmarks folder (full hierarchy) | Every cycle |
-| Browsing history | Safari History.db (incremental) | Every cycle |
 
 Tabs are only synced while Firefox is running. If Firefox is closed, the cycle completes silently without them.
-
-History sync is forward-only from the first install. No historical visits are seeded.
 
 ## How it works
 
 Each 5-minute cycle, `sync.py`:
 
 1. Reads open tabs from Firefox's `recovery.jsonlz4` session file
-2. Reads bookmarks and history from `places.sqlite` (read-only, no lock contention)
+2. Reads bookmarks from `places.sqlite` (read-only, no lock contention)
 3. Writes tabs and bookmarks into `~/Library/Safari/Bookmarks.plist` atomically
-4. Writes new history visits into `~/Library/Safari/History.db`
-5. Advances a watermark in `~/.config/firefox-safari-sync/state.json`
 
 Bookmark nodes use deterministic UUIDs derived from Firefox GUIDs. Unchanged nodes produce the same UUID every cycle, preventing iCloud sync churn.
 
@@ -99,18 +94,23 @@ firefox-safari-sync/
 Runtime paths (outside the repo):
 
 ```
-~/.config/firefox-safari-sync/state.json
+~/.config/firefox-safari-sync/state.json  # cached Firefox profile path
 ~/Library/Logs/firefox-safari-sync/stdout.log
 ~/Library/Logs/firefox-safari-sync/stderr.log
 ~/Library/LaunchAgents/com.user.firefox-safari-sync.plist
 ```
+
+## Why history sync is not included
+
+Safari history sync uses CloudKit — a record-oriented push protocol — mediated by a private system daemon (`SafariCloudHistoryPushAgent`) and an XPC service (`com.apple.Safari.History`) that requires a private Apple entitlement. Writing rows directly into `History.db` bypasses this stack entirely: no CloudKit event is emitted, and the rows never propagate to iOS. Apple's own forensic research has confirmed that iCloud can actively overwrite a locally modified `History.db` with the server copy, discarding external writes.
+
+`Bookmarks.plist` works differently — iCloud syncs it as a file, so direct writes are picked up by `cloudd` via FSEvents and propagate to iOS. History does not have this property.
 
 ## Known limitations
 
 - **iCloud propagation latency** is non-deterministic. Changes appear on iOS within seconds to minutes when iCloud is healthy.
 - **Safari in-memory state** can overwrite a daemon write on quit. The next 5-minute cycle self-heals.
 - **iCloud race condition**: a remote change arriving from iOS can overwrite `Bookmarks.plist`. The next cycle re-applies Firefox data.
-- **History duplicates**: if a history write fails mid-cycle, the next cycle retries the same window. Duplicate visits for the same URL within a 5-second window are possible but rare.
 
 ## After a Homebrew Python upgrade
 
