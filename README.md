@@ -2,7 +2,7 @@
 
 One-way sync from Firefox on macOS to Safari — bookmarks and open tabs.
 
-Runs as a macOS LaunchAgent every 5 minutes. iCloud propagates Safari changes to iOS automatically.
+Runs as a macOS LaunchAgent every 5 minutes. **Note:** iCloud does not reliably propagate external writes to Safari bookmarks — see [Known limitations](#known-limitations).
 
 ## Requirements
 
@@ -78,7 +78,7 @@ Each 5-minute cycle, `sync.py`:
 
 Bookmark nodes use deterministic UUIDs derived from Firefox GUIDs. Unchanged nodes produce the same UUID every cycle, preventing iCloud sync churn.
 
-iCloud propagation to iOS is non-deterministic. The daemon's responsibility ends when it writes to Safari's local files.
+iCloud propagation to iOS requires a manual trigger — see Known limitations.
 
 ## File layout
 
@@ -104,7 +104,7 @@ Runtime paths (outside the repo):
 
 Safari history sync uses CloudKit — a record-oriented push protocol — mediated by a private system daemon (`SafariCloudHistoryPushAgent`) and an XPC service (`com.apple.Safari.History`) that requires a private Apple entitlement. Writing rows directly into `History.db` bypasses this stack entirely: no CloudKit event is emitted, and the rows never propagate to iOS. Apple's own forensic research has confirmed that iCloud can actively overwrite a locally modified `History.db` with the server copy, discarding external writes.
 
-`Bookmarks.plist` works differently — iCloud syncs it as a file, so direct writes are picked up by `cloudd` via FSEvents and propagate to iOS. History does not have this property.
+`Bookmarks.plist` is file-based, so direct writes are visible to Safari locally. However, `cloudd` does not reliably pick up external writes for iCloud upload — iOS propagation requires a manual iCloud Safari toggle. History does not even have this property, making it entirely unviable.
 
 ## Known limitations
 
