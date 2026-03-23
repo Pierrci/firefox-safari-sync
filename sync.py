@@ -15,6 +15,7 @@ import plistlib
 import sqlite3
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 

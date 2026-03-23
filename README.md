@@ -108,7 +108,7 @@ Safari history sync uses CloudKit — a record-oriented push protocol — mediat
 
 ## Known limitations
 
-- **iCloud propagation latency** is non-deterministic. Changes appear on iOS within seconds to minutes when iCloud is healthy.
+- **iCloud bookmark sync requires a manual trigger.** The daemon writes `Bookmarks.plist` correctly, but `cloudd` does not reliably upload external writes to iCloud. Changes may not appear on iOS for hours or at all. The only reliable way to force propagation is to manually toggle Safari sync off and back on in **System Settings → Apple ID → iCloud → Safari**. There is no programmatic way to trigger this: restarting `bird` is blocked by SIP, and writing to `MobileMeAccounts.plist` has no effect because `accountsd` manages service state via XPC, not file-watching.
 - **Safari in-memory state** can overwrite a daemon write on quit. The next 5-minute cycle self-heals.
 - **iCloud race condition**: a remote change arriving from iOS can overwrite `Bookmarks.plist`. The next cycle re-applies Firefox data.
 
